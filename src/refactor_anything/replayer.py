@@ -221,10 +221,9 @@ def _exc_text(exc: dict[str, str] | None, out: Any) -> str:
 
 def _limit_memory(mb: int) -> None:
     """A mutant that loops while allocating must die of MemoryError, not take the machine with it."""
-    try:
-        import resource
-    except ImportError:  # Windows: the timeout alone bounds it
+    if sys.platform == "win32":  # no rlimits: the timeout alone bounds it
         return
+    import resource
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_AS)
         want = mb * 1024 * 1024
@@ -267,8 +266,12 @@ def main(argv: list[str]) -> int:
         out = run(job)
     except BaseException as exc:  # e.g. the module itself fails to import
         out = {"results": [], "error": f"{type(exc).__name__}: {exc}"}
-    with open(result_path, "w", encoding="utf-8") as fh:
+    # Write then rename: a process that dies mid-write (a mutant at its memory cap) must leave no
+    # half-written result behind, only a missing one, which the parent reports as a crash.
+    tmp = result_path + ".part"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(out, fh)
+    os.replace(tmp, result_path)
     return 0
 
 

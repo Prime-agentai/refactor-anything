@@ -127,11 +127,25 @@ class _Encoder:
         state = _state(v)
         if state is not None:
             return {"obj": qualname(v), "attrs": {k: self.enc(x, depth + 1) for k, x in sorted(state.items())}}
-        return {"repr": qualname(v), "text": _ADDR.sub("", _safe_repr(v))}
+        return {"repr": _portable_name(v), "text": _ADDR.sub("", _safe_repr(v))}
 
     @staticmethod
     def _cls(v: Any, plain: tuple[type, ...]) -> dict[str, str]:
         return {} if type(v) in plain else {"cls": qualname(v)}
+
+
+def _is_stdlib(t: type) -> bool:
+    top = (getattr(t, "__module__", "") or "").split(".")[0]
+    return top in sys.stdlib_module_names or top == "builtins"
+
+
+def _portable_name(v: Any) -> str:
+    """Stdlib classes move between private modules across versions (pathlib -> pathlib._local in
+    3.13); name them by their public top-level module so a lock survives a Python upgrade."""
+    t = type(v)
+    if _is_stdlib(t):
+        return f"{(t.__module__ or '').split('.')[0]}.{t.__qualname__}"
+    return qualname(v)
 
 
 def _is_self_iter(v: Any) -> bool:
@@ -147,8 +161,7 @@ def _state(v: Any) -> dict[str, Any] | None:
     Standard-library objects (Path, Decimal, datetime, UUID, ...) are compared by repr:
     their internal slots hold lazily computed caches that differ between equal values.
     """
-    top = (getattr(type(v), "__module__", "") or "").split(".")[0]
-    if top in sys.stdlib_module_names or top == "builtins":
+    if _is_stdlib(type(v)):
         return None
     d = getattr(v, "__dict__", None)
     attrs: dict[str, Any] = dict(d) if isinstance(d, dict) else {}

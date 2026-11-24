@@ -101,7 +101,10 @@ def replay(lock: Lock, cases: list[dict[str, Any]], *, mutant: dict[str, Any] | 
         out_path = t / "result.json"
         if not out_path.exists():
             return ReplayRun([], error="replay process exited without a result (crashed or killed)")
-        data = json.loads(out_path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(out_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ReplayRun([], error="replay process crashed while writing its result")
     return ReplayRun(data.get("results", []), data.get("error"), float(data.get("seconds", 0.0)))
 
 

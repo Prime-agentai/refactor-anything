@@ -24,7 +24,7 @@ class MutantResult:
     col: int
     description: str
     killed: bool
-    how: str  # "case", "timeout", "import", or "" for a survivor
+    how: str  # "case", "timeout", "crash", or "" for a survivor
     code: str  # the original source line, for the report
 
 
@@ -120,7 +120,7 @@ def run(root: Path, *, modules: list[str] | None = None, functions: set[str] | N
             if r.timed_out:
                 killed, how = True, "timeout"
             elif r.error:
-                killed, how = True, "import"
+                killed, how = True, "crash"  # did not import, or died (e.g. at its memory cap)
             else:
                 killed = any(x["status"] != "pass" for x in r.results)
                 how = "case" if killed else ""

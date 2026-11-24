@@ -58,7 +58,9 @@ def test_objects_compare_by_class_and_state() -> None:
 
 
 def test_stdlib_objects_use_repr_without_addresses() -> None:
-    assert canon(pathlib.PurePosixPath("/a/b")) == {"repr": "pathlib.PurePosixPath", "text": "PurePosixPath('/a/b')"}
+    path_canon = canon(pathlib.PurePosixPath("/a/b"))
+    assert path_canon["text"] == "PurePosixPath('/a/b')"
+    assert path_canon["repr"] == "pathlib.PurePosixPath"  # not pathlib._local.PurePosixPath on 3.13+
     assert canon(decimal.Decimal("1.10"))["text"] == "Decimal('1.10')"
     p = pathlib.Path("x")
     str(p)  # fills internal caches; the encoding must not change
