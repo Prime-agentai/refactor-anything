@@ -1,0 +1,48 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Check (types, tests, CLI end to end)
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+        run: uv run --python ${{ matrix.python }} --no-project --with pytest --with mypy bash -c 'PYTHON="$(command -v python)" bash scripts/check.sh'
+
+  quickstart:
+    # The README quickstart: the tool runs from its own uv environment while the recorded project
+    # runs on the system Python, so the runtime copy has to work across interpreters.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Quickstart
+        shell: bash
+        run: |
+          src="$GITHUB_WORKSPACE"
+          refactor-anything() { uv tool run --from "$src" refactor-anything "$@"; }
+          cd "$(mktemp -d)"
+          printf 'def slug(s):\n    return "-".join(s.lower().split())\n' > textutil.py
+          printf 'import textutil, unittest\nclass T(unittest.TestCase):\n    def test(self):\n        self.assertEqual(textutil.slug("Hello World"), "hello-world")\n        textutil.slug("  A  b ")\n' > test_textutil.py
+          refactor-anything record textutil -- python3 -m unittest -q
+          refactor-anything strength
+          refactor-anything check
+          printf 'def slug(s):\n    words = s.lower().split()\n    return "-".join(words)\n' > textutil.py
+          refactor-anything check
+          printf 'def slug(s):\n    return "-".join(s.split())\n' > textutil.py
+          if refactor-anything check; then echo "expected a diff" >&2; exit 1; fi
+          refactor-anything install claude
+          grep -q "hook stop" .claude/*.json
+          grep -q "name: refactor-anything" .claude/skills/refactor-anything/SKILL.md

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .engine import check
+from .envs import injected_bin
 from .store import DIR, Lock, LockError, sha256_file
 
 MAX_BLOCKS = 3
@@ -43,8 +44,12 @@ change the code. A refactor is done when the replay matches, not when the code l
 
 
 def self_command() -> str:
-    if shutil.which("refactor-anything"):
+    """How hooks and agents should call us later, after this process (and any uvx shim) is gone."""
+    found = shutil.which("refactor-anything")
+    inj = injected_bin()
+    if found and (inj is None or Path(found).resolve().parent != inj.resolve()):
         return "refactor-anything"
+    # Run through uvx/pipx, or not on PATH: pin the interpreter that has us installed.
     return f"{shlex.quote(sys.executable)} -m refactor_anything"
 
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import store
+from .envs import user_path
 from .recorder import ENV
 from .store import Lock, LockError, rel, sha256_file
 from .targets import Target, merge, split_key
@@ -147,11 +148,13 @@ def record(root: Path, targets: list[Target], command: list[str], *, cap: int = 
     with tempfile.TemporaryDirectory(prefix="refactor-anything-boot-") as tmp:
         boot = make_boot(Path(tmp), sitecustomize=True)
         env = dict(os.environ)
+        env["PATH"] = user_path()  # `python3` in the command must be the user's, not uvx's
         env["PYTHONPATH"] = str(boot) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         env[ENV] = json.dumps({"out": str(raw_dir), "cap": cap, "private": private,
                                "targets": [t.to_json() for t in lock.targets]})
+        exe = shutil.which(command[0], path=env["PATH"]) or command[0]
         try:
-            proc = subprocess.run(command, cwd=root, env=env)
+            proc = subprocess.run([exe, *command[1:]], cwd=root, env=env)
         except OSError as exc:
             raise RecordError(f"cannot run {command[0]}: {exc}") from exc
 
@@ -321,9 +324,3 @@ def check(root: Path, *, python: str | None = None, timeout: float = 600.0) -> C
             res.failures.append(r)
     return res
 
-
-def load_lock(root: Path) -> Lock:
-    try:
-        return Lock.load(root.resolve())
-    except LockError:
-        raise
