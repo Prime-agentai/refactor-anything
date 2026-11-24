@@ -7,6 +7,7 @@ raise: a hook that crashes must not wedge the user's session.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .engine import check
-from .store import DIR, Lock, LockError
+from .store import DIR, Lock, LockError, sha256_file
 
 MAX_BLOCKS = 3
 OFF_ENV = "REFACTOR_ANYTHING_HOOK"
@@ -97,12 +98,23 @@ def stop_hook() -> int:
     except (OSError, ValueError):
         state = {}
     session = str(payload.get("session_id", "unknown"))
-    blocks = int(state.get(session, 0))
+    entry = state.get(session) if isinstance(state.get(session), dict) else {}
+    blocks = int(entry.get("blocks", 0))
+    # What the agent is being told about: the locked sources and which cases differ.
+    seen = hashlib.sha256(json.dumps([[lock.sources[m]["file"], sha256_file(root / lock.sources[m]["file"])]
+                                      for m in sorted(lock.sources)] +
+                                     sorted([f["key"], f["id"], f["status"]] for f in result.failures)).encode()).hexdigest()
+    if blocks and entry.get("seen") == seen:
+        # Nothing changed since the last block: the agent has chosen to stop and report. Let it.
+        print(json.dumps({"systemMessage": "refactor-anything: behaviour still differs from the recording and the code is "
+                                            "unchanged since the last block, so the agent is stopping with "
+                                            f"{len(result.failures)} differing cases. Run `refactor-anything check` to see them."}))
+        return 0
     if blocks >= MAX_BLOCKS:
         print(json.dumps({"systemMessage": f"refactor-anything: recorded behaviour still differs after {MAX_BLOCKS} attempts "
                                             "in this session. Not blocking again; run `refactor-anything check` to see the cases."}))
         return 0
-    state[session] = blocks + 1
+    state[session] = {"blocks": blocks + 1, "seen": seen}
     try:
         state_path.write_text(json.dumps(state), encoding="utf-8")
     except OSError:

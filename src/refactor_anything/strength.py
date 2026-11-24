@@ -21,6 +21,7 @@ class StrengthError(RuntimeError):
 class MutantResult:
     function: str
     line: int
+    col: int
     description: str
     killed: bool
     how: str  # "case", "timeout", "import", or "" for a survivor
@@ -70,7 +71,7 @@ class StrengthReport:
             "score": round(self.score, 4), "killed": self.killed, "total": self.total,
             "functions": {k: {"killed": a, "total": b} for k, a, b in ((k, *v) for k, v in self.per_function().items())},
             "survivors": [
-                {"module": m.module, "file": m.file, "function": r.function, "line": r.line,
+                {"module": m.module, "file": m.file, "function": r.function, "line": r.line, "col": r.col,
                  "mutation": r.description, "code": r.code}
                 for m in self.modules for r in m.results if not r.killed
             ],
@@ -124,7 +125,7 @@ def run(root: Path, *, modules: list[str] | None = None, functions: set[str] | N
                 killed = any(x["status"] != "pass" for x in r.results)
                 how = "case" if killed else ""
             code = lines[m.line - 1].strip() if 0 < m.line <= len(lines) else ""
-            return MutantResult(m.function, m.line, m.description, killed, how, code)
+            return MutantResult(m.function, m.line, m.col + 1, m.description, killed, how, code)
 
         workers = jobs or max(1, min(8, (os.cpu_count() or 2)))
         with ThreadPoolExecutor(max_workers=workers) as pool:

@@ -12,7 +12,7 @@ def test_record_then_check_passes(tmp_path: Path) -> None:
     root = make_project(tmp_path)
     out = record(root, "textkit").stdout
     assert "textkit:slugify" in out
-    assert "generator function" in out  # lines() is reported, not silently skipped
+    assert "textkit:lines" in out  # a generator: recorded as it is consumed
     code, res = check_json(root)
     assert code == 0 and res["ok"], res
     assert res["functions"]["textkit:slugify"] == {"pass": 8}
@@ -206,3 +206,89 @@ def test_markdown_and_status(tmp_path: Path) -> None:
     assert "behaviour unchanged" in md and "| `textkit:slugify` | 8/8 |" in md
     st = ra(root, "status").stdout
     assert "changed since recording: none" in st and "textkit:lines" in st
+
+
+GEN = '''\
+def evens(limit):
+    n = 0
+    while n < limit:
+        yield n
+        n += 2
+
+
+def risky(items):
+    for x in items:
+        if x < 0:
+            raise ValueError("negative")
+        yield x * 10
+
+
+def echo():
+    got = yield "ready"
+    while got is not None:
+        got = yield got.upper()
+'''
+
+GEN_RUN = '''\
+import itertools, gen
+list(gen.evens(7))
+list(itertools.islice(gen.evens(100), 3))   # partly consumed: only these 3 are locked
+try:
+    list(gen.risky([1, -1, 2]))
+except ValueError:
+    pass
+e = gen.echo()
+next(e); e.send("a"); e.send("b")
+'''
+
+
+def test_generators_are_recorded_lazily(tmp_path: Path) -> None:
+    root = make_project(tmp_path, {"gen.py": GEN, "run.py": GEN_RUN})
+    record(root, "gen", cmd=("run.py",))
+    code, res = check_json(root)
+    assert code == 0, res
+    assert res["functions"] == {"gen:evens": {"pass": 2}, "gen:risky": {"pass": 1}, "gen:echo": {"pass": 1}}
+    # a list-returning rewrite is fine: callers iterate the same items
+    edit(root, "gen.py", "def evens(limit):\n    n = 0\n    while n < limit:\n        yield n\n        n += 2\n",
+         "def evens(limit):\n    return iter(range(0, limit, 2))\n")
+    assert check_json(root)[0] == 0
+
+
+def test_generator_changes_are_caught(tmp_path: Path) -> None:
+    root = make_project(tmp_path, {"gen.py": GEN, "run.py": GEN_RUN})
+    record(root, "gen", cmd=("run.py",))
+    edit(root, "gen.py", "    while n < limit:", "    while n <= limit:")
+    edit(root, "gen.py", 'raise ValueError("negative")', "continue")
+    code, res = check_json(root)
+    assert code == 1
+    by_key = {f["key"]: f for f in res["failures"]}
+    assert set(by_key) == {"gen:risky"}  # evens(7) still stops at 6: `<=` is invisible with this input
+    assert by_key["gen:risky"]["diff"] == "exception"
+    edit(root, "gen.py", "    while n <= limit:", "    while n < limit + 2:")
+    code, res = check_json(root)
+    f = next(f for f in res["failures"] if f["key"] == "gen:evens")
+    assert f["expected"] == "stopped after 4 items" and f["actual"] == "kept yielding after 4 items"
+
+
+def test_functions_returning_generators_and_iterators(tmp_path: Path) -> None:
+    root = make_project(tmp_path, {
+        "it.py": "def gen_of(xs):\n    return (x * 2 for x in xs)\n\n\ndef map_of(xs):\n    return map(str, xs)\n\n\n"
+                 "def pairs(a, b):\n    return zip(a, b, strict=True)\n",
+        "run.py": "import it\nlist(it.gen_of([1, 2]))\nlist(it.map_of([1, 2]))\ntry:\n    list(it.pairs([1, 2], [3]))\n"
+                  "except ValueError:\n    pass\n",
+    })
+    out = record(root, "it", cmd=("run.py",)).stdout
+    assert "only its type is locked" not in out
+    assert check_json(root)[0] == 0
+    edit(root, "it.py", "strict=True", "strict=False")
+    code, res = check_json(root)
+    assert code == 1 and res["failures"][0]["diff"] == "exception"  # zip raised after 1 item; now it just stops
+    edit(root, "it.py", "strict=False", "strict=True")
+    edit(root, "it.py", "return (x * 2 for x in xs)", "return (x * 3 for x in xs)")
+    edit(root, "it.py", "return map(str, xs)", "return map(repr, [str(x) for x in xs])")
+    code, res = check_json(root)
+    assert code == 1
+    by_key = {f["key"]: f for f in res["failures"]}
+    assert by_key["it:gen_of"]["expected"] == "yielded [2, 4]"
+    # the map's items were filled in by re-running the original after recording
+    assert by_key["it:map_of"]["expected"] == "yielded ['1', '2']" and by_key["it:map_of"]["actual"] == "yielded [\"'1'\", \"'2'\"]"

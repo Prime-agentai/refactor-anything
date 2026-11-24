@@ -11,6 +11,7 @@ arguments *after* the call (so in-place mutation is part of the locked behaviour
 
 from __future__ import annotations
 
+import atexit
 import base64
 import functools
 import hashlib
@@ -62,11 +63,18 @@ def call_kind(owner: Any, name: str) -> str | None:
 
 
 def unsupported_reason(fn: Any) -> str | None:
-    if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
-        return "generator function (the call returns a lazy iterator)"
+    if inspect.isasyncgenfunction(fn):
+        return "async generator"
     if inspect.iscoroutinefunction(fn):
         return "async function"
     return None
+
+
+def _is_lazy_iterator(x: Any) -> bool:
+    try:
+        return hasattr(x, "__next__") and iter(x) is x
+    except Exception:
+        return False
 
 
 class _Writer:
@@ -87,7 +95,14 @@ class _Writer:
             path = os.path.join(self.out_dir, f"{self.pid}-{os.urandom(4).hex()}.jsonl")
             self.fh = open(path, "a", encoding="utf-8")
             self.seen = {}
+            atexit.register(self.close)
         return self.fh
+
+    def close(self) -> None:
+        with self.lock:
+            if self.fh is not None:
+                self.fh.close()
+                self.fh = None
 
     def write(self, rec: dict[str, Any]) -> None:
         line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
@@ -184,6 +199,7 @@ class Recorder:
 
     def _wrapper(self, fn: Callable[..., Any], k: str, kind: str) -> Callable[..., Any]:
         writer = self.writer
+        is_gen = inspect.isgeneratorfunction(fn)
 
         @functools.wraps(fn)
         def recorded(*args: Any, **kwargs: Any) -> Any:
@@ -202,21 +218,71 @@ class Recorder:
                 _local.busy = False
             if blob is None:
                 return fn(*args, **kwargs)
+            if is_gen:  # creating a generator runs none of its body: record lazily, as it is consumed
+                return self._recording_gen(fn(*args, **kwargs), k, kind, blob, stored, kwargs)
             try:
                 result = fn(*args, **kwargs)
             except BaseException as exc:
                 self._save(k, kind, blob, stored, kwargs, None, exc)
                 raise
-            self._save(k, kind, blob, stored, kwargs, result, None)
+            if isinstance(result, types.GeneratorType):  # a function that returns a generator: same as one
+                return self._recording_gen(result, k, kind, blob, stored, kwargs)
+            # A map/zip/islice/... cannot be consumed here without stealing it from the caller: the
+            # items are filled in later by re-running the original on the same input (see engine.fill).
+            self._save(k, kind, blob, stored, kwargs, result, None, fill=_is_lazy_iterator(result))
             return result
 
         recorded.__refactor_anything_original__ = fn  # type: ignore[attr-defined]
         return recorded
 
-    def _save(self, k: str, kind: str, blob: bytes, args: Any, kwargs: Any, result: Any, exc: BaseException | None) -> None:
+    def _recording_gen(self, gen: Any, k: str, kind: str, blob: bytes, args: Any, kwargs: Any) -> Any:
+        """Yield what ``gen`` yields (forwarding send()), and record the items the caller consumed."""
+        items: list[Any] = []
+        sends: list[Any] = []
+        end = "open"
+        failure: BaseException | None = None
+        sent: Any = None
+        try:
+            while True:
+                sends.append(sent)
+                try:
+                    value = gen.send(sent) if sent is not None else next(gen)
+                except StopIteration as stop:
+                    end = "stop"
+                    return stop.value
+                _local.busy = True
+                try:
+                    items.append(canon.canon(value))
+                finally:
+                    _local.busy = False
+                sent = yield value
+        except GeneratorExit:
+            close = getattr(gen, "close", None)
+            if callable(close):
+                close()
+            raise
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            trace: dict[str, Any] = {"items": items, "end": end}
+            if any(v is not None for v in sends):
+                try:
+                    trace["sends"] = base64.b64encode(pickle.dumps(sends, protocol=PICKLE_PROTOCOL)).decode("ascii")
+                except Exception as exc:
+                    self.writer.note(k, "unpicklable", f"value sent into the generator: {type(exc).__name__}: {exc}")
+                    trace = {}
+            if trace:
+                self._save(k, kind, blob, args, kwargs, None, failure, gen_trace=trace)
+
+    def _save(self, k: str, kind: str, blob: bytes, args: Any, kwargs: Any, result: Any, exc: BaseException | None,
+              gen_trace: dict[str, Any] | None = None, fill: bool = False) -> None:
         if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
             return
-        cid = hashlib.sha256(blob).hexdigest()[:16]
+        digest = hashlib.sha256(blob)
+        if gen_trace is not None:  # the same input consumed to a different depth is a different case
+            digest.update(f"|{len(gen_trace['items'])}|{gen_trace['end']}|{exc is not None}".encode())
+        cid = digest.hexdigest()[:16]
         _local.busy = True
         try:
             with self.writer.lock:
@@ -225,9 +291,13 @@ class Recorder:
                 return
             rec: dict[str, Any] = {"key": k, "kind": kind, "id": cid,
                                    "args": base64.b64encode(blob).decode("ascii")}
-            if exc is None:
+            if gen_trace is not None:
+                rec["gen"] = gen_trace
+            elif exc is None:
                 rec["out"] = canon.canon(result)
-            else:
+                if fill:
+                    rec["fill"] = True
+            if exc is not None:
                 rec["exc"] = exc_info(exc)
             rec["after"] = canon.canon([list(args), kwargs])
             self.writer.write(rec)

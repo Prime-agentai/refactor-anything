@@ -76,11 +76,44 @@ def _install_mutant(m: dict[str, Any]) -> None:
         mod.__package__ = name
     else:
         mod.__package__ = name.rpartition(".")[0]
-    sys.modules[name] = mod
     parent, _, leaf = name.rpartition(".")
-    if parent:
-        setattr(importlib.import_module(parent), leaf, mod)
+    # Import the package (and with it the original module) the normal way first, so modules that
+    # import from this one during package start-up see a complete module, not an empty mutant.
+    parent_mod = importlib.import_module(parent) if parent else None
+    sys.modules[name] = mod
     exec(compile(m["source"], m["filename"], "exec"), mod.__dict__)
+    if parent_mod is not None:
+        setattr(parent_mod, leaf, mod)
+
+
+FILL_CAP = 1000
+
+
+def fill_case(case: dict[str, Any]) -> dict[str, Any]:
+    """Re-run the original on a recorded input and consume the iterator it returns (up to FILL_CAP)."""
+    module, qual = split_key(case["key"])
+    res: dict[str, Any] = {"key": case["key"], "id": case["id"]}
+    try:
+        stored, kwargs = pickle.loads(base64.b64decode(case["args"]))
+        args = list(stored)
+        items: list[Any] = []
+        end = "open"
+        raised: BaseException | None = None
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            it = iter(_call(module, qual, case["kind"], args, kwargs))
+            try:
+                for _ in range(FILL_CAP):
+                    items.append(canon.canon(next(it)))
+            except StopIteration:
+                end = "stop"
+            except Exception as exc:  # raising part-way through is behaviour too
+                raised = exc
+        res.update(status="filled", gen={"items": items, "end": end}, after=canon.canon([args, kwargs]))
+        if raised is not None:
+            res["exc"] = exc_info(raised)
+    except Exception as exc:  # the iterator raised while consumed: leave the case type-only
+        res.update(status="unfilled", detail=f"{type(exc).__name__}: {exc}")
+    return res
 
 
 def replay_case(case: dict[str, Any]) -> dict[str, Any]:
@@ -95,9 +128,38 @@ def replay_case(case: dict[str, Any]) -> dict[str, Any]:
     out: Any = None
     err: BaseException | None = None
     sink = io.StringIO()
+    want_gen = case.get("gen")
+    got_gen: dict[str, Any] | None = None
     try:
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
             out = _call(module, qual, case["kind"], args, kwargs)
+            if want_gen is not None:
+                got_gen = {"items": [], "end": "open"}
+                try:
+                    it = iter(out)
+                except TypeError:
+                    res.update(status="fail", diff="output", expected="an iterator", actual="returned " + canon.preview(canon.canon(out)))
+                    return res
+                sends = pickle.loads(base64.b64decode(want_gen["sends"])) if want_gen.get("sends") else []
+
+                def step(i: int) -> Any:
+                    value = sends[i] if i < len(sends) else None
+                    if value is None or not hasattr(it, "send"):
+                        return next(it)
+                    return it.send(value)
+
+                try:
+                    for i in range(len(want_gen["items"])):
+                        got_gen["items"].append(canon.canon(step(i)))
+                    if want_gen["end"] == "stop" or case.get("exc"):
+                        step(len(want_gen["items"]))
+                        got_gen["end"] = "more"  # it yielded beyond where the original stopped
+                except StopIteration:
+                    got_gen["end"] = "stop"
+                finally:
+                    close = getattr(it, "close", None)
+                    if callable(close):
+                        close()
     except _Missing as exc:
         res.update(status="missing", detail=str(exc))
         return res
@@ -105,22 +167,31 @@ def replay_case(case: dict[str, Any]) -> dict[str, Any]:
         raise
     except BaseException as exc:  # SystemExit is behaviour too
         err = exc
+    got_out: Any = None
     try:
         got_after = canon.canon([args, kwargs])
-        if err is None:
+        if err is None and want_gen is None:
             got_out = canon.canon(out)
     except Exception as exc:
         res.update(status="fail", diff="output", detail=f"result could not be encoded: {type(exc).__name__}: {exc}")
         return res
 
     want_exc = case.get("exc")
+    if want_gen is not None and got_gen is not None:
+        if got_gen["items"] != want_gen["items"]:
+            res.update(status="fail", diff="output", path=canon.first_difference(want_gen["items"], got_gen["items"]),
+                       expected="yielded " + _items_text(want_gen["items"]), actual="yielded " + _items_text(got_gen["items"]))
+            return res
+        if err is None and want_exc is None and got_gen["end"] != want_gen["end"]:
+            res.update(status="fail", diff="output", expected=_end_text(want_gen), actual=_end_text(got_gen))
+            return res
     if err is not None or want_exc is not None:
         got_exc = exc_info(err) if err is not None else None
         if got_exc != want_exc:
             res.update(status="fail", diff="exception",
-                       expected=_exc_text(want_exc, case.get("out")), actual=_exc_text(got_exc, None if err else got_out))
+                       expected=_exc_text(want_exc, case.get("out")), actual=_exc_text(got_exc, got_out) if want_gen is None or got_exc else _end_text(got_gen or {"items": [], "end": "open"}))
             return res
-    elif got_out != case.get("out"):
+    elif want_gen is None and got_out != case.get("out"):
         res.update(status="fail", diff="output", path=canon.first_difference(case.get("out"), got_out),
                    expected=canon.preview(case.get("out")), actual=canon.preview(got_out))
         return res
@@ -130,6 +201,16 @@ def replay_case(case: dict[str, Any]) -> dict[str, Any]:
         return res
     res["status"] = "pass"
     return res
+
+
+def _items_text(items: list[Any]) -> str:
+    return canon.preview({"list": items})
+
+
+def _end_text(g: dict[str, Any]) -> str:
+    n = len(g["items"])
+    return {"stop": f"stopped after {n} items", "more": f"kept yielding after {n} items",
+            "open": f"{n} items consumed"}[g["end"]]
 
 
 def _exc_text(exc: dict[str, str] | None, out: Any) -> str:
@@ -174,7 +255,7 @@ def run(job: dict[str, Any]) -> dict[str, Any]:
                 importlib.import_module(module)
         except BaseException as exc:
             return {"results": [], "error": f"module {module} does not import: {type(exc).__name__}: {exc}", "seconds": 0.0}
-    results = [replay_case(c) for c in job["cases"]]
+    results = [fill_case(c) if job.get("fill") else replay_case(c) for c in job["cases"]]
     return {"results": results, "seconds": round(time.perf_counter() - started, 4)}
 
 

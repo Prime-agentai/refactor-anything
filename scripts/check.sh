@@ -67,7 +67,7 @@ PY
 ra check > /dev/null
 
 # strength named a blind spot: `qty < 0` -> `qty <= 0` survives, no recorded call has qty == 0.
-grep -q 'invoice.py:4  total: `<` -> `<=`' strength.out
+grep -q 'invoice.py:4:12  total: `<` -> `<=`' strength.out
 sed -i.bak 's/if qty < 0:/if qty <= 0:/' invoice.py && rm invoice.py.bak
 ra check > /dev/null   # ...and indeed the lock cannot see that change yet
 git_restore() { sed -i.bak 's/if qty <= 0:/if qty < 0:/' invoice.py && rm invoice.py.bak; }

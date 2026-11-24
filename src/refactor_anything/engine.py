@@ -76,7 +76,8 @@ class ReplayRun:
 
 
 def replay(lock: Lock, cases: list[dict[str, Any]], *, mutant: dict[str, Any] | None = None,
-           timeout: float = 600.0, python: str | None = None, memory_mb: int | None = None) -> ReplayRun:
+           timeout: float = 600.0, python: str | None = None, memory_mb: int | None = None,
+           fill: bool = False) -> ReplayRun:
     if not cases:
         return ReplayRun([])
     py = python or lock.python or sys.executable
@@ -84,7 +85,7 @@ def replay(lock: Lock, cases: list[dict[str, Any]], *, mutant: dict[str, Any] | 
         t = Path(tmp)
         boot = make_boot(t / "boot", sitecustomize=False)
         job = {"root": str(lock.root), "sys_path": lock.abs_sys_path(), "cases": cases, "mutant": mutant,
-               "memory_mb": memory_mb}
+               "memory_mb": memory_mb, "fill": fill}
         (t / "job.json").write_text(json.dumps(job), encoding="utf-8")
         env = {k: v for k, v in os.environ.items() if k != ENV}
         env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -175,8 +176,10 @@ def record(root: Path, targets: list[Target], command: list[str], *, cap: int = 
         for k in m.get("keys", []):
             lock.functions.setdefault(k, {})
     for m in metas:
-        if m.get("meta") in ("unsupported", "unpicklable", "record-error"):
-            notes[m["key"]] = f"{m['meta']}: {m.get('detail', '')}"
+        if m.get("meta") in ("unsupported", "unpicklable", "record-error", "iterator"):
+            text = f"{m['meta']}: {m.get('detail', '')}" if m["meta"] != "iterator" else str(m.get("detail", ""))
+            if text not in notes.get(m["key"], ""):
+                notes[m["key"]] = (notes[m["key"]] + "; " if m["key"] in notes else "") + text
             lock.functions.setdefault(m["key"], {})["note"] = notes[m["key"]]
     if python:
         lock.python = python
@@ -194,10 +197,28 @@ def record(root: Path, targets: list[Target], command: list[str], *, cap: int = 
         ids.add(c["id"])
         fresh_cases.append(c)
 
+    tmp_lock = Lock(root, python=lock.python, sys_path=lock.sys_path)
+    # Fill: a returned map/zip/islice was not consumed while recording; consume it now, from the same
+    # input and the same code, so its items are locked and not just its type.
+    to_fill = [c for c in fresh_cases if c.pop("fill", False)]
+    if to_fill:
+        run = replay(tmp_lock, to_fill, fill=True)
+        by_id = {(r["key"], r["id"]): r for r in run.results if r.get("status") == "filled"}
+        for c in to_fill:
+            r = by_id.get((c["key"], c["id"]))
+            if r is not None:
+                c.pop("out", None)
+                c["gen"], c["after"] = r["gen"], r["after"]
+                if r.get("exc"):
+                    c["exc"] = r["exc"]
+            else:
+                note = "returns an iterator whose items could not be replayed: only its type is locked"
+                notes.setdefault(c["key"], note)
+                lock.functions.setdefault(c["key"], {})["note"] = notes[c["key"]]
+
     # Stabilise: replay new cases twice, in fresh processes, against the code that produced them.
     unstable_ids: set[tuple[str, str]] = set()
     if fresh_cases:
-        tmp_lock = Lock(root, python=lock.python, sys_path=lock.sys_path)
         for _ in range(2):
             run = replay(tmp_lock, fresh_cases)
             if run.error:

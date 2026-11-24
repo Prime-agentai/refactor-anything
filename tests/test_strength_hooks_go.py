@@ -37,7 +37,7 @@ def test_strength_kills_and_lists_survivors(tmp_path: Path) -> None:
     assert (root / ".refactor-anything" / "runs" / "strength.json").exists()
     p = ra(root, "strength", "--min", "99")
     assert p.returncode == 1 and "below --min" in p.stderr
-    assert "survivors" in p.stdout and "cd.py:10" in p.stdout
+    assert "survivors" in p.stdout and "cd.py:10:8" in p.stdout
 
 
 def test_strength_refuses_when_lock_already_fails(tmp_path: Path) -> None:
@@ -67,11 +67,16 @@ def test_stop_hook_blocks_until_behaviour_matches(tmp_path: Path) -> None:
     assert out is not None and out["decision"] == "block"
     assert "textkit:chunk" in str(out["reason"]) and "(1/3)" in str(out["reason"])
     assert _stop(root, REFACTOR_ANYTHING_HOOK="off") is None
-    _stop(root)
-    _stop(root)
-    final = _stop(root)  # fourth time in the same session: let it stop, but say so
+    again = _stop(root)  # nothing changed since the block: the agent is reporting, let it stop
+    assert again is not None and "decision" not in again and "unchanged since the last block" in str(again["systemMessage"])
+    for i, bad in enumerate(["- 2", "- 3"], start=2):  # it keeps editing and keeps failing: block, up to 3 times
+        edit(root, "textkit.py", "range(0, len(items) - " + str(i - 1) + ", n)", "range(0, len(items) " + bad + ", n)")
+        out = _stop(root)
+        assert out is not None and out["decision"] == "block" and f"({i}/3)" in str(out["reason"])
+    edit(root, "textkit.py", "range(0, len(items) - 3, n)", "range(0, len(items) - 4, n)")
+    final = _stop(root)  # a fourth failing attempt in the same session: let it stop, but say so
     assert final is not None and "decision" not in final and "after 3 attempts" in str(final["systemMessage"])
-    edit(root, "textkit.py", "range(0, len(items) - 1, n)", "range(0, len(items), n)")
+    edit(root, "textkit.py", "range(0, len(items) - 4, n)", "range(0, len(items), n)")
     assert _stop(root, session="s2") is None
 
 

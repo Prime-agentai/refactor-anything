@@ -44,9 +44,11 @@ def cmd_record(ns: argparse.Namespace) -> int:
     width = max([len(k) for k in [*s.per_key, *s.notes, *s.never_called]] + [8])
     print(f"\n  {'function':<{width}}  {'cases':>5}  {'unstable':>8}")
     for k, d in sorted(s.per_key.items()):
-        print(f"  {k:<{width}}  {d['cases']:>5}  {d['unstable']:>8}")
+        note = f"  ({s.notes[k]})" if k in s.notes else ""
+        print(f"  {k:<{width}}  {d['cases']:>5}  {d['unstable']:>8}{note}")
     for k, note in sorted(s.notes.items()):
-        print(f"  {k:<{width}}  {'-':>5}  {'':>8}  {note}")
+        if k not in s.per_key:
+            print(f"  {k:<{width}}  {0:>5}  {'':>8}  ({note})")
     for k in s.never_called:
         print(f"  {k:<{width}}  {0:>5}  {'':>8}  never called by this command: not locked")
     all_unstable = [k for k, d in s.per_key.items() if d["cases"] == 0 and d["unstable"]]
@@ -135,7 +137,7 @@ def cmd_strength(ns: argparse.Namespace) -> int:
         if survivors:
             print("\nsurvivors (behaviour could change here and the lock would not notice):")
             for s in survivors[: ns.limit]:
-                print(f"  {s['file']}:{s['line']}  {s['function']}: {s['mutation']}    {s['code']}")
+                print(f"  {s['file']}:{s['line']}:{s['col']}  {s['function']}: {s['mutation']}    {s['code']}")
             if len(survivors) > ns.limit:
                 print(f"  ... {len(survivors) - ns.limit} more in {DIR}/runs/strength.json")
         print(f"\nlock strength {_pct(rep.killed, rep.total)}: {rep.killed}/{rep.total} mutants caught")

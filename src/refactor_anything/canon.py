@@ -84,6 +84,8 @@ class _Encoder:
         if isinstance(v, BaseException):
             return {"exc": qualname(v), "args": self._seq(v.args, depth)}
 
+        if hasattr(v, "__next__") and _is_self_iter(v):
+            return {"iterator": qualname(v)}  # its items do not exist yet; only the type is comparable
         vid = id(v)
         if vid in self.stack:
             return {"cycle": len(self.stack) - self.stack.index(vid)}
@@ -130,6 +132,13 @@ class _Encoder:
     @staticmethod
     def _cls(v: Any, plain: tuple[type, ...]) -> dict[str, str]:
         return {} if type(v) in plain else {"cls": qualname(v)}
+
+
+def _is_self_iter(v: Any) -> bool:
+    try:
+        return iter(v) is v
+    except Exception:
+        return False
 
 
 def _state(v: Any) -> dict[str, Any] | None:
