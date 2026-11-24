@@ -54,8 +54,13 @@ Rules:
 """
 
 
-def agent_argv(agent: str, prompt: str, *, model: str | None, session: str, first: bool, cmd: str) -> tuple[list[str], str | None]:
-    """The agent command line and, for custom agents, the text to send on stdin."""
+def agent_argv(agent: str, prompt: str, *, model: str | None, session: str, first: bool,
+               cmd: str) -> tuple[list[str] | str, str | None]:
+    """The agent command line and, for custom agents, the text to send on stdin.
+
+    A custom agent is a shell command string, run with ``shell=True``: on Windows that is the only
+    way cmd.exe receives its quotes intact (``["cmd", "/c", ...]`` escapes them as ``\\"``).
+    """
     if agent == "claude":
         argv = ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
                 "--allowedTools", f"Bash({cmd} check:*)", "Bash(python -m pytest:*)", "Read", "Edit", "Write", "Glob", "Grep"]
@@ -68,7 +73,7 @@ def agent_argv(agent: str, prompt: str, *, model: str | None, session: str, firs
         if model:
             argv += ["--model", model]
         return argv + [prompt], None
-    return ["sh", "-c", agent] if os.name != "nt" else ["cmd", "/c", agent], prompt
+    return agent, prompt
 
 
 @dataclass
@@ -97,10 +102,11 @@ def go(root: Path, goal: str, *, agent: str = "claude", rounds: int = 3, model: 
     for n in range(1, rounds + 1):
         result.rounds = n
         argv, stdin_text = agent_argv(agent, prompt, model=model, session=session, first=(n == 1), cmd=cmd)
-        echo(f"refactor-anything: round {n}/{rounds}: running {argv[0] if agent in ('claude', 'codex') else agent}")
+        echo(f"refactor-anything: round {n}/{rounds}: running {agent if isinstance(argv, str) else argv[0]}")
         try:
             proc = subprocess.run(argv, cwd=root, env=env, input=stdin_text, text=True, timeout=timeout,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=isinstance(argv, str),
+                                  encoding="utf-8", errors="replace")
         except FileNotFoundError as exc:
             raise GoError(f"agent not found: {exc}") from exc
         except subprocess.TimeoutExpired:
@@ -108,6 +114,9 @@ def go(root: Path, goal: str, *, agent: str = "claude", rounds: int = 3, model: 
             echo(result.log[-1])
             continue
         result.log.append(f"round {n}: agent exited {proc.returncode}")
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stdout or "").strip().splitlines()[-15:])
+            echo(f"refactor-anything: round {n}: the agent exited {proc.returncode}" + (f"; its last output:\n{tail}" if tail else ""))
         if fingerprint(root) != fp:
             raise GoError("the agent changed the recording in .refactor-anything/. Run rejected. "
                           "Restore it (git checkout -- .refactor-anything) and review the agent's code changes by hand.")
